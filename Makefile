@@ -15,9 +15,9 @@ CUDA_SOURCES = $(wildcard $(SRCDIR)/*.cu)
 OBJECTS = $(CUDA_SOURCES:$(SRCDIR)/%.cu=$(OBJDIR)/%.o)
 
 # Compiler flags
-NVCC_FLAGS = -std=c++11 -O3 -arch=sm_50
+NVCC_FLAGS = -std=c++11 -O3 -arch=sm_50 -Xcompiler -fopenmp
 INCLUDES = -I$(INCDIR)
-LIBS = -lSDL2 -lcurand -lm
+LIBS = -lSDL2 -lcurand -lm -lgomp
 
 # Create directories if they don't exist
 $(shell mkdir -p $(OBJDIR) $(BINDIR))

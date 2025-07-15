@@ -199,14 +199,15 @@ int main(int argc, char* argv[]) {
 
         if (needs_render) {
             startTime = SDL_GetTicks();
-            render_frame_cuda(renderer, texture, current_window_width, current_window_height);
+            render_frame_hybrid(renderer, texture, current_window_width, current_window_height);
             endTime = SDL_GetTicks();
-            printf("Render time: %u ms\n", endTime - startTime);
+            printf("Hybrid render time: %u ms\n", endTime - startTime);
             needs_render = 0;
         }
     }
 
     cleanup_gpu_data();
+    cleanup_hybrid_rendering();
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);

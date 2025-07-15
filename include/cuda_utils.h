@@ -5,6 +5,7 @@
 #include <curand_kernel.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "common_math.h"
 
 // CUDA error checking macro
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }

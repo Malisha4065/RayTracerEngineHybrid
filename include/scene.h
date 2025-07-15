@@ -3,6 +3,7 @@
 
 #include "hittables.h"
 #include "camera_shared.h"
+#include "hybrid_render.h"
 #include <SDL2/SDL.h>
 
 // Host-side scene management

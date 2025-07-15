@@ -27,4 +27,7 @@ __device__ bool world_hit_device(const SphereData_Device* spheres, int num_spher
                                  const CubeData_Device* cubes, int num_cubes,
                                  const Ray* r, float t_min, float t_max, HitRecord_Device* rec);
 
+// --- Host-side hit functions ---
+void hit_record_set_face_normal_host(HitRecord_Device* rec, const Ray* r, const Vec3* outward_normal);
+
 #endif // HITTABLES_H
