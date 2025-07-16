@@ -1,0 +1,88 @@
+# Makefile for Hybrid Ray Tracer Performance Analyzer
+
+# Compiler and flags
+NVCC = nvcc
+CXX = g++
+CUDA_FLAGS = -O3 -std=c++11 -Xcompiler -fopenmp
+HOST_FLAGS = -O3 -std=c++11 -fopenmp
+
+# Directories
+SRC_DIR = src
+INCLUDE_DIR = include
+OBJ_DIR = obj
+BIN_DIR = bin
+
+# CUDA architecture (adjust based on your GPU)
+CUDA_ARCH = -gencode arch=compute_52,code=sm_52 -gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75
+
+# Libraries
+LIBS = -lcuda -lcurand -lm -lSDL2
+
+# Include directories
+INCLUDES = -I$(INCLUDE_DIR) -I/usr/local/cuda/include
+
+# Source files
+ANALYZER_SRC = hybrid_performance_analyzer.cpp
+CUDA_SOURCES = $(SRC_DIR)/kernels.cu $(SRC_DIR)/scene.cu $(SRC_DIR)/hybrid_render.cu $(SRC_DIR)/hybrid_analyzer_cuda.cu
+HOST_SOURCES = $(SRC_DIR)/main.cu
+
+# Object files
+ANALYZER_OBJ = $(OBJ_DIR)/hybrid_performance_analyzer.o
+CUDA_OBJECTS = $(OBJ_DIR)/kernels.o $(OBJ_DIR)/scene.o $(OBJ_DIR)/hybrid_render.o $(OBJ_DIR)/hybrid_analyzer_cuda.o
+
+# Executables
+ANALYZER_TARGET = $(BIN_DIR)/hybrid_analyzer
+RAYTRACER_TARGET = $(BIN_DIR)/raytracer
+
+# Default target
+all: $(ANALYZER_TARGET)
+
+# Create directories
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
+
+# Compile CUDA source files
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu | $(OBJ_DIR)
+	$(NVCC) $(CUDA_FLAGS) $(CUDA_ARCH) $(INCLUDES) -c $< -o $@
+
+# Compile analyzer
+$(ANALYZER_OBJ): $(ANALYZER_SRC) | $(OBJ_DIR)
+	$(NVCC) $(CUDA_FLAGS) $(CUDA_ARCH) $(INCLUDES) -c $< -o $@
+
+# Link analyzer
+$(ANALYZER_TARGET): $(ANALYZER_OBJ) $(CUDA_OBJECTS) | $(BIN_DIR)
+	$(NVCC) $(CUDA_FLAGS) $(CUDA_ARCH) $^ -o $@ $(LIBS)
+
+# Original raytracer target
+$(RAYTRACER_TARGET): $(CUDA_OBJECTS) $(OBJ_DIR)/main.o | $(BIN_DIR)
+	$(NVCC) $(CUDA_FLAGS) $(CUDA_ARCH) $^ -o $@ $(LIBS)
+
+$(OBJ_DIR)/main.o: $(SRC_DIR)/main.cu | $(OBJ_DIR)
+	$(NVCC) $(CUDA_FLAGS) $(CUDA_ARCH) $(INCLUDES) -c $< -o $@
+
+# Clean
+clean:
+	rm -rf $(OBJ_DIR) $(BIN_DIR)
+
+# Phony targets
+.PHONY: all clean
+
+# Run analyzer
+run-analyzer: $(ANALYZER_TARGET)
+	./$(ANALYZER_TARGET)
+
+# Run raytracer
+run-raytracer: $(RAYTRACER_TARGET)
+	./$(RAYTRACER_TARGET)
+
+# Help
+help:
+	@echo "Available targets:"
+	@echo "  all           - Build the hybrid performance analyzer"
+	@echo "  clean         - Remove all build files"
+	@echo "  run-analyzer  - Run the performance analyzer"
+	@echo "  run-raytracer - Run the main raytracer"
+	@echo "  help          - Show this help message"
