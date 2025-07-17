@@ -332,7 +332,12 @@ Vec3 ray_color_host(const Ray* r,
     return vec3_add(vec3_scale(white, 1.0f - t), vec3_scale(blue, t));
 }
 
-// Main hybrid rendering function
+// Performance tracking for dynamic load balancing
+static float gpu_split_ratio = 0.7f; // GPU handles 70% of work initially
+static double last_gpu_time = 0.0;
+static double last_cpu_time = 0.0;
+
+// Main hybrid rendering function with true workload splitting
 void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width, int height) {
     // Update resolution if it changed
     if (width != g_current_width || height != g_current_height) {
@@ -347,67 +352,65 @@ void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width
     // Setup camera
     camera_init_host(&d_camera, g_camera_pos_host, g_camera_lookat_host, g_camera_vup_host, g_fov_y_degrees_host, (float)width / height);
     
-    // Decision: Use GPU for large resolutions, CPU+OpenMP for smaller ones
-    bool use_gpu = (width * height > 320 * 240);
+    // True hybrid rendering: Split workload between GPU and CPU
+    printf("Using TRUE HYBRID rendering (GPU+CPU concurrent)\n");
     
-    if (use_gpu) {
-        printf("Using GPU rendering\n");
-        // Use the existing CUDA kernel
+    // Calculate split point based on performance ratio
+    int gpu_end_row = (int)(height * gpu_split_ratio);
+    int cpu_start_row = gpu_end_row;
+    
+    // Ensure minimum work for both processors
+    if (gpu_end_row < height / 10) gpu_end_row = height / 10;
+    if (cpu_start_row > height - height / 10) cpu_start_row = height - height / 10;
+    
+    printf("GPU handling rows 0-%d, CPU handling rows %d-%d\n", gpu_end_row-1, cpu_start_row, height-1);
+    
+    // Allocate host memory for final image
+    Vec3* h_pixels = (Vec3*)malloc(width * height * sizeof(Vec3));
+    if (!h_pixels) {
+        printf("Error: Failed to allocate host memory\n");
+        return;
+    }
+    
+    // Timing variables
+    double gpu_start_time, gpu_end_time, cpu_start_time, cpu_end_time;
+    
+    // Create events for GPU timing
+    cudaEvent_t gpu_start_event, gpu_end_event;
+    cudaEventCreate(&gpu_start_event);
+    cudaEventCreate(&gpu_end_event);
+    
+    // Start GPU work asynchronously
+    cudaEventRecord(gpu_start_event, 0);
+    
+    if (gpu_end_row > 0) {
+    if (gpu_end_row > 0) {
+        // GPU renders top portion
         dim3 threadsPerBlock(16, 16);
         dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                      (height + threadsPerBlock.y - 1) / threadsPerBlock.y);
+                      (gpu_end_row + threadsPerBlock.y - 1) / threadsPerBlock.y);
         
-        render_kernel<<<numBlocks, threadsPerBlock>>>(d_pixel_data, width, height, d_camera,
-                                                     d_spheres_data, h_num_spheres,
-                                                     d_cubes_data, h_num_cubes,
-                                                     d_rand_states);
+        // Launch GPU kernel for top portion only
+        render_kernel_region<<<numBlocks, threadsPerBlock>>>(d_pixel_data, width, height, 
+                                                           0, 0, width, gpu_end_row,
+                                                           d_camera, d_spheres_data, h_num_spheres,
+                                                           d_cubes_data, h_num_cubes, d_rand_states);
         gpuErrchk(cudaPeekAtLastError());
-        gpuErrchk(cudaDeviceSynchronize());
-        
-        // Copy results back to host
-        Vec3* h_pixels = (Vec3*)malloc(width * height * sizeof(Vec3));
-        gpuErrchk(cudaMemcpy(h_pixels, d_pixel_data, width * height * sizeof(Vec3), cudaMemcpyDeviceToHost));
-        
-        // Convert to SDL format
-        void *sdl_pixels_locked;
-        int pitch;
-        SDL_LockTexture(texture, NULL, &sdl_pixels_locked, &pitch);
-        unsigned char *pixel_data_sdl = (unsigned char *)sdl_pixels_locked;
-        
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                Vec3 p_color = h_pixels[y * width + x];
-                int ir = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, p_color.x)));
-                int ig = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, p_color.y)));
-                int ib = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, p_color.z)));
-                
-                int index = y * pitch + x * 4;
-                pixel_data_sdl[index + 0] = (unsigned char)ib; // Blue
-                pixel_data_sdl[index + 1] = (unsigned char)ig; // Green
-                pixel_data_sdl[index + 2] = (unsigned char)ir; // Red
-                pixel_data_sdl[index + 3] = 255;               // Alpha
-            }
-        }
-        
-        free(h_pixels);
-        SDL_UnlockTexture(texture);
-    } else {
-        printf("Using CPU+OpenMP rendering\n");
-        // Use OpenMP for CPU rendering
-        void *sdl_pixels_locked;
-        int pitch;
-        SDL_LockTexture(texture, NULL, &sdl_pixels_locked, &pitch);
-        unsigned char *pixel_data_sdl = (unsigned char *)sdl_pixels_locked;
-        
-        #pragma omp parallel for schedule(dynamic) collapse(2)
-        for (int y = 0; y < height; y++) {
+    }
+    
+    // Start CPU work concurrently (don't wait for GPU)
+    cpu_start_time = omp_get_wtime();
+    
+    if (cpu_start_row < height) {
+        // CPU renders bottom portion using OpenMP
+        #pragma omp parallel for schedule(dynamic, 4) collapse(2)
+        for (int y = cpu_start_row; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 unsigned int seed = (unsigned int)(time(NULL) + y * width + x + omp_get_thread_num() * 1000);
                 Vec3 pixel_color = vec3_create(0,0,0);
                 
                 for (int s = 0; s < SAMPLES_PER_PIXEL; ++s) {
                     float u = (float)(x + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (width - 1);
-                    float v = (float)(y + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (height - 1);
                     float v_cam = (float)((height - 1 - y) + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (height - 1);
                     
                     Ray r = camera_get_ray_host(&d_camera, u, v_cam);
@@ -416,26 +419,90 @@ void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width
                 pixel_color = vec3_div(pixel_color, (float)SAMPLES_PER_PIXEL);
                 
                 // Gamma correction
-                pixel_color.x = sqrtf(pixel_color.x);
-                pixel_color.y = sqrtf(pixel_color.y);
-                pixel_color.z = sqrtf(pixel_color.z);
+                pixel_color.x = sqrtf(fmaxf(0.0f, pixel_color.x));
+                pixel_color.y = sqrtf(fmaxf(0.0f, pixel_color.y));
+                pixel_color.z = sqrtf(fmaxf(0.0f, pixel_color.z));
                 
-                // Convert to SDL format
-                int ir = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, pixel_color.x)));
-                int ig = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, pixel_color.y)));
-                int ib = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, pixel_color.z)));
-                
-                int index = y * pitch + x * 4;
-                pixel_data_sdl[index + 0] = (unsigned char)ib; // Blue
-                pixel_data_sdl[index + 1] = (unsigned char)ig; // Green
-                pixel_data_sdl[index + 2] = (unsigned char)ir; // Red
-                pixel_data_sdl[index + 3] = 255;               // Alpha
+                // Store in host buffer
+                h_pixels[y * width + x] = pixel_color;
+            }
+        }
+    }
+    
+    cpu_end_time = omp_get_wtime();
+    last_cpu_time = cpu_end_time - cpu_start_time;
+    
+    // Wait for GPU to complete and get results
+    if (gpu_end_row > 0) {
+        cudaDeviceSynchronize();
+        cudaEventRecord(gpu_end_event, 0);
+        cudaEventSynchronize(gpu_end_event);
+        
+        float gpu_time_ms;
+        cudaEventElapsedTime(&gpu_time_ms, gpu_start_event, gpu_end_event);
+        last_gpu_time = gpu_time_ms / 1000.0; // Convert to seconds
+        
+        // Copy GPU results to host buffer (top portion)
+        Vec3* h_gpu_pixels = (Vec3*)malloc(width * gpu_end_row * sizeof(Vec3));
+        gpuErrchk(cudaMemcpy(h_gpu_pixels, d_pixel_data, width * gpu_end_row * sizeof(Vec3), cudaMemcpyDeviceToHost));
+        
+        // Copy GPU results to main buffer
+        for (int y = 0; y < gpu_end_row; y++) {
+            for (int x = 0; x < width; x++) {
+                h_pixels[y * width + x] = h_gpu_pixels[y * width + x];
             }
         }
         
-        SDL_UnlockTexture(texture);
+        free(h_gpu_pixels);
     }
+    
+    // Dynamic load balancing: Adjust split ratio based on performance
+    if (last_gpu_time > 0.0 && last_cpu_time > 0.0) {
+        float gpu_pixels_per_sec = (gpu_end_row * width) / last_gpu_time;
+        float cpu_pixels_per_sec = ((height - cpu_start_row) * width) / last_cpu_time;
+        
+        float total_performance = gpu_pixels_per_sec + cpu_pixels_per_sec;
+        float new_gpu_ratio = gpu_pixels_per_sec / total_performance;
+        
+        // Smooth the adjustment to avoid oscillation
+        gpu_split_ratio = 0.8f * gpu_split_ratio + 0.2f * new_gpu_ratio;
+        
+        // Clamp to reasonable bounds
+        if (gpu_split_ratio < 0.1f) gpu_split_ratio = 0.1f;
+        if (gpu_split_ratio > 0.9f) gpu_split_ratio = 0.9f;
+        
+        printf("Performance: GPU=%.1f Mpix/s, CPU=%.1f Mpix/s, New ratio=%.2f\n", 
+               gpu_pixels_per_sec/1e6, cpu_pixels_per_sec/1e6, gpu_split_ratio);
+    }
+    
+    // Convert to SDL format
+    void *sdl_pixels_locked;
+    int pitch;
+    SDL_LockTexture(texture, NULL, &sdl_pixels_locked, &pitch);
+    unsigned char *pixel_data_sdl = (unsigned char *)sdl_pixels_locked;
+    
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            Vec3 p_color = h_pixels[y * width + x];
+            int ir = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, p_color.x)));
+            int ig = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, p_color.y)));
+            int ib = (int)(255.999f * fminf(1.0f, fmaxf(0.0f, p_color.z)));
+            
+            int index = y * pitch + x * 4;
+            pixel_data_sdl[index + 0] = (unsigned char)ib; // Blue
+            pixel_data_sdl[index + 1] = (unsigned char)ig; // Green
+            pixel_data_sdl[index + 2] = (unsigned char)ir; // Red
+            pixel_data_sdl[index + 3] = 255;               // Alpha
+        }
+    }
+    
+    // Cleanup
+    free(h_pixels);
+    cudaEventDestroy(gpu_start_event);
+    cudaEventDestroy(gpu_end_event);
+    SDL_UnlockTexture(texture);
     
     SDL_RenderCopy(renderer, texture, NULL, NULL);
     SDL_RenderPresent(renderer);
+}
 }

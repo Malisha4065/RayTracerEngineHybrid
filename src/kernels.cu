@@ -223,6 +223,44 @@ __global__ void render_kernel(Vec3* fb, int width, int height,
     rand_states[pixel_index] = local_rand_state;
 }
 
+// --- Region-based Render Kernel for Hybrid Rendering ---
+__global__ void render_kernel_region(Vec3* fb, int fb_width, int fb_height,
+                                    int region_start_x, int region_start_y,
+                                    int region_end_x, int region_end_y,
+                                    Camera_Device cam,
+                                    SphereData_Device* spheres, int num_spheres,
+                                    CubeData_Device* cubes, int num_cubes,
+                                    curandState *rand_states) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x + region_start_x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y + region_start_y;
+
+    if (x >= region_end_x || y >= region_end_y || x < region_start_x || y < region_start_y) return;
+    if (x >= fb_width || y >= fb_height || x < 0 || y < 0) return;
+
+    int pixel_index = y * fb_width + x;
+    if (pixel_index >= fb_width * fb_height) return;
+    curandState local_rand_state = rand_states[pixel_index];
+
+    Vec3 pixel_color = vec3_create(0,0,0);
+    for (int s = 0; s < SAMPLES_PER_PIXEL; ++s) {
+        float u = (float)(x + ((SAMPLES_PER_PIXEL > 1) ? random_float_device(&local_rand_state) : 0.5f)) / (fb_width - 1);
+        float v_img = (float)(y + ((SAMPLES_PER_PIXEL > 1) ? random_float_device(&local_rand_state) : 0.5f)) / (fb_height - 1);
+        float v_cam = 1.0f - v_img;
+
+        Ray r = camera_get_ray_device(&cam, u, v_cam);
+        pixel_color = vec3_add(pixel_color, ray_color_device(&r, spheres, num_spheres, cubes, num_cubes, MAX_DEPTH, &local_rand_state));
+    }
+    pixel_color = vec3_div(pixel_color, (float)SAMPLES_PER_PIXEL);
+
+    // Gamma correction
+    pixel_color.x = sqrtf(fmaxf(0.0f, pixel_color.x));
+    pixel_color.y = sqrtf(fmaxf(0.0f, pixel_color.y));
+    pixel_color.z = sqrtf(fmaxf(0.0f, pixel_color.z));
+    
+    fb[pixel_index] = pixel_color;
+    rand_states[pixel_index] = local_rand_state;
+}
+
 // --- Kernel to initialize cuRAND states ---
 __global__ void init_random_states_kernel(curandState *rand_states, int num_states, unsigned long long seed_offset) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

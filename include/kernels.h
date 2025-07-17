@@ -19,6 +19,14 @@ __global__ void render_kernel(Vec3* fb, int width, int height,
                               CubeData_Device* cubes, int num_cubes,
                               curandState *rand_states);
 
+__global__ void render_kernel_region(Vec3* fb, int fb_width, int fb_height,
+                                    int region_start_x, int region_start_y,
+                                    int region_end_x, int region_end_y,
+                                    Camera_Device cam,
+                                    SphereData_Device* spheres, int num_spheres,
+                                    CubeData_Device* cubes, int num_cubes,
+                                    curandState *rand_states);
+
 __global__ void init_random_states_kernel(curandState *rand_states, int num_states, unsigned long long seed_offset);
 
 #endif // KERNELS_H
