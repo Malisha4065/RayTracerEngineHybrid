@@ -8,105 +8,33 @@
 #include <math.h>
 #include <string.h>
 #include <omp.h>
+#include <algorithm> // for std::min
 
 // Global variables for hybrid rendering
-static cudaStream_t streams[MAX_STREAMS];
-static Vec3* d_tile_buffers[MAX_STREAMS];
-static curandState* d_tile_rand_states[MAX_STREAMS];
 static bool hybrid_initialized = false;
-static int max_tile_pixels = 0;
 
 // Initialize hybrid rendering resources
 void init_hybrid_rendering(int max_width, int max_height) {
     if (hybrid_initialized) return;
     
-    // Calculate maximum pixels per tile
-    max_tile_pixels = TILE_SIZE * TILE_SIZE;
-    
-    // Create CUDA streams
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        gpuErrchk(cudaStreamCreate(&streams[i]));
-        
-        // Allocate memory for each stream (enough for one tile)
-        gpuErrchk(cudaMalloc((void**)&d_tile_buffers[i], max_tile_pixels * sizeof(Vec3)));
-        gpuErrchk(cudaMalloc((void**)&d_tile_rand_states[i], max_tile_pixels * sizeof(curandState)));
-        
-        // Initialize random states for this stream
-        dim3 threadsPerBlock(256);
-        dim3 numBlocks((max_tile_pixels + threadsPerBlock.x - 1) / threadsPerBlock.x);
-        init_random_states_kernel<<<numBlocks, threadsPerBlock, 0, streams[i]>>>(
-            d_tile_rand_states[i], max_tile_pixels, (unsigned long long)time(NULL) + i * 1000);
-    }
-    
-    // Synchronize all streams
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        gpuErrchk(cudaStreamSynchronize(streams[i]));
-    }
+    // Initialize OpenMP
+    omp_set_dynamic(0);
+    int max_threads = omp_get_max_threads();
+    omp_set_num_threads(max_threads);
     
     hybrid_initialized = true;
-    printf("Hybrid rendering initialized with %d streams\n", MAX_STREAMS);
+    printf("Hybrid rendering initialized with %d OpenMP threads\n", max_threads);
 }
 
 // Cleanup hybrid rendering resources
 void cleanup_hybrid_rendering() {
     if (!hybrid_initialized) return;
     
-    for (int i = 0; i < MAX_STREAMS; i++) {
-        gpuErrchk(cudaStreamDestroy(streams[i]));
-        if (d_tile_buffers[i]) gpuErrchk(cudaFree(d_tile_buffers[i]));
-        if (d_tile_rand_states[i]) gpuErrchk(cudaFree(d_tile_rand_states[i]));
-    }
-    
     hybrid_initialized = false;
     printf("Hybrid rendering cleanup complete\n");
 }
 
-// CUDA kernel for tile-based rendering - simplified version
-__global__ void render_tile_kernel(Vec3* tile_buffer, int tile_width, int tile_height,
-                                   int global_start_x, int global_start_y,
-                                   int fb_width, int fb_height,
-                                   Camera_Device cam,
-                                   SphereData_Device* spheres, int num_spheres,
-                                   CubeData_Device* cubes, int num_cubes,
-                                   curandState *rand_states) {
-    int local_x = blockIdx.x * blockDim.x + threadIdx.x;
-    int local_y = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (local_x >= tile_width || local_y >= tile_height) return;
-    
-    int global_x = global_start_x + local_x;
-    int global_y = global_start_y + local_y;
-    
-    if (global_x >= fb_width || global_y >= fb_height) return;
-    
-    int local_pixel_index = local_y * tile_width + local_x;
-    curandState local_rand_state = rand_states[local_pixel_index];
-    
-    Vec3 pixel_color = vec3_create(0,0,0);
-    for (int s = 0; s < SAMPLES_PER_PIXEL; ++s) {
-        float u = (float)(global_x + ((SAMPLES_PER_PIXEL > 1) ? curand_uniform(&local_rand_state) : 0.5f)) / (fb_width - 1);
-        float v_img = (float)(global_y + ((SAMPLES_PER_PIXEL > 1) ? curand_uniform(&local_rand_state) : 0.5f)) / (fb_height - 1);
-        float v_cam = 1.0f - v_img;
-        
-        Ray r = camera_get_ray_device(&cam, u, v_cam);
-        
-        // Simple ray tracing - just background for now since we can't easily link ray_color_device
-        Vec3 unit_direction = vec3_normalize(r.direction);
-        float t = 0.5f * (unit_direction.y + 1.0f);
-        Vec3 white = vec3_create(1.0f, 1.0f, 1.0f);
-        Vec3 blue = vec3_create(0.5f, 0.7f, 1.0f);
-        pixel_color = vec3_add(pixel_color, vec3_add(vec3_scale(white, 1.0f - t), vec3_scale(blue, t)));
-    }
-    pixel_color = vec3_div(pixel_color, (float)SAMPLES_PER_PIXEL);
-    
-    // Gamma correction
-    pixel_color.x = sqrtf(fmaxf(0.0f, pixel_color.x));
-    pixel_color.y = sqrtf(fmaxf(0.0f, pixel_color.y));
-    pixel_color.z = sqrtf(fmaxf(0.0f, pixel_color.z));
-    
-    tile_buffer[local_pixel_index] = pixel_color;
-    rand_states[local_pixel_index] = local_rand_state;
-}
+// We'll use the render_kernel_region directly from kernels.cu instead of duplicating code
 
 // Host-side random number generation (simple LCG)
 float random_float_host(unsigned int* seed) {
@@ -336,8 +264,9 @@ Vec3 ray_color_host(const Ray* r,
 static float gpu_split_ratio = 0.7f; // GPU handles 70% of work initially
 static double last_gpu_time = 0.0;
 static double last_cpu_time = 0.0;
+static int next_tile_atomic = 0; // Atomic counter for work distribution
 
-// Main hybrid rendering function with true workload splitting
+// Enhanced tile-based hybrid rendering function
 void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width, int height) {
     // Update resolution if it changed
     if (width != g_current_width || height != g_current_height) {
@@ -352,18 +281,20 @@ void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width
     // Setup camera
     camera_init_host(&d_camera, g_camera_pos_host, g_camera_lookat_host, g_camera_vup_host, g_fov_y_degrees_host, (float)width / height);
     
-    // True hybrid rendering: Split workload between GPU and CPU
     printf("Using TRUE HYBRID rendering (GPU+CPU concurrent)\n");
     
-    // Calculate split point based on performance ratio
-    int gpu_end_row = (int)(height * gpu_split_ratio);
-    int cpu_start_row = gpu_end_row;
+    // Calculate tile grid
+    int tile_size_x = TILE_SIZE;
+    int tile_size_y = TILE_SIZE;
+    int num_tiles_x = (width + tile_size_x - 1) / tile_size_x;
+    int num_tiles_y = (height + tile_size_y - 1) / tile_size_y;
+    int total_tiles = num_tiles_x * num_tiles_y;
     
-    // Ensure minimum work for both processors
-    if (gpu_end_row < height / 10) gpu_end_row = height / 10;
-    if (cpu_start_row > height - height / 10) cpu_start_row = height - height / 10;
+    // Reset atomic counter for work distribution
+    next_tile_atomic = 0;
     
-    printf("GPU handling rows 0-%d, CPU handling rows %d-%d\n", gpu_end_row-1, cpu_start_row, height-1);
+    printf("Image size: %dx%d, Tile size: %dx%d, Total tiles: %d\n", 
+           width, height, tile_size_x, tile_size_y, total_tiles);
     
     // Allocate host memory for final image
     Vec3* h_pixels = (Vec3*)malloc(width * height * sizeof(Vec3));
@@ -372,107 +303,212 @@ void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width
         return;
     }
     
-    // Timing variables
-    double gpu_start_time, gpu_end_time, cpu_start_time, cpu_end_time;
-    
     // Create events for GPU timing
     cudaEvent_t gpu_start_event, gpu_end_event;
     cudaEventCreate(&gpu_start_event);
     cudaEventCreate(&gpu_end_event);
     
-    // Start GPU work asynchronously
+    // Split tiles between GPU and CPU based on current performance ratio
+    int gpu_tiles = (int)(total_tiles * gpu_split_ratio);
+    int cpu_tiles = total_tiles - gpu_tiles;
+    
+    // Ensure minimum work for both processors
+    if (gpu_tiles < 1) gpu_tiles = 1;
+    if (cpu_tiles < 1) cpu_tiles = 1;
+    
+    // Adjust tile count
+    if (gpu_tiles > total_tiles) gpu_tiles = total_tiles;
+    cpu_tiles = total_tiles - gpu_tiles;
+    
+    printf("GPU handling %d tiles, CPU handling %d tiles (ratio: %.2f)\n", 
+           gpu_tiles, cpu_tiles, gpu_split_ratio);
+    
+    // Start timing
     cudaEventRecord(gpu_start_event, 0);
+    double cpu_start_time = omp_get_wtime();
     
-    if (gpu_end_row > 0) {
-    if (gpu_end_row > 0) {
-        // GPU renders top portion
-        dim3 threadsPerBlock(16, 16);
-        dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                      (gpu_end_row + threadsPerBlock.y - 1) / threadsPerBlock.y);
-        
-        // Launch GPU kernel for top portion only
-        render_kernel_region<<<numBlocks, threadsPerBlock>>>(d_pixel_data, width, height, 
-                                                           0, 0, width, gpu_end_row,
-                                                           d_camera, d_spheres_data, h_num_spheres,
-                                                           d_cubes_data, h_num_cubes, d_rand_states);
-        gpuErrchk(cudaPeekAtLastError());
-    }
-    
-    // Start CPU work concurrently (don't wait for GPU)
-    cpu_start_time = omp_get_wtime();
-    
-    if (cpu_start_row < height) {
-        // CPU renders bottom portion using OpenMP
-        #pragma omp parallel for schedule(dynamic, 4) collapse(2)
-        for (int y = cpu_start_row; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                unsigned int seed = (unsigned int)(time(NULL) + y * width + x + omp_get_thread_num() * 1000);
-                Vec3 pixel_color = vec3_create(0,0,0);
+    // Process tiles in parallel with both GPU and CPU
+    #pragma omp parallel sections
+    {
+        // GPU SECTION
+        #pragma omp section
+        {
+            for (int i = 0; i < gpu_tiles; i++) {
+                // Get next tile to process
+                int tile_idx;
+                #pragma omp atomic capture
+                tile_idx = next_tile_atomic++;
                 
-                for (int s = 0; s < SAMPLES_PER_PIXEL; ++s) {
-                    float u = (float)(x + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (width - 1);
-                    float v_cam = (float)((height - 1 - y) + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (height - 1);
-                    
-                    Ray r = camera_get_ray_host(&d_camera, u, v_cam);
-                    pixel_color = vec3_add(pixel_color, ray_color_host(&r, h_spheres_data, h_num_spheres, h_cubes_data, h_num_cubes, MAX_DEPTH, &seed));
+                if (tile_idx >= total_tiles) continue;
+                
+                // Calculate tile coordinates
+                int tile_x = tile_idx % num_tiles_x;
+                int tile_y = tile_idx / num_tiles_x;
+                
+                int tile_start_x = tile_x * tile_size_x;
+                int tile_start_y = tile_y * tile_size_y;
+                int tile_end_x = std::min(tile_start_x + tile_size_x, width);
+                int tile_end_y = std::min(tile_start_y + tile_size_y, height);
+                
+                // Launch kernel for this tile
+                dim3 threadsPerBlock(16, 16);
+                dim3 numBlocks(
+                    (tile_end_x - tile_start_x + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                    (tile_end_y - tile_start_y + threadsPerBlock.y - 1) / threadsPerBlock.y
+                );
+                
+                render_kernel_region<<<numBlocks, threadsPerBlock>>>(
+                    d_pixel_data, width, height,
+                    tile_start_x, tile_start_y, 
+                    tile_end_x, tile_end_y,
+                    d_camera, d_spheres_data, h_num_spheres,
+                    d_cubes_data, h_num_cubes, d_rand_states
+                );
+            }
+            
+            // Wait for GPU to complete
+            cudaDeviceSynchronize();
+            
+            // Copy GPU results back to host
+            cudaMemcpy(h_pixels, d_pixel_data, width * height * sizeof(Vec3), cudaMemcpyDeviceToHost);
+            
+            // Record GPU time
+            cudaEventRecord(gpu_end_event, 0);
+            cudaEventSynchronize(gpu_end_event);
+            float gpu_time_ms;
+            cudaEventElapsedTime(&gpu_time_ms, gpu_start_event, gpu_end_event);
+            last_gpu_time = gpu_time_ms / 1000.0; // Convert to seconds
+            
+            // Dynamic work stealing - process more tiles if available
+            while (true) {
+                int tile_idx;
+                #pragma omp atomic capture
+                tile_idx = next_tile_atomic++;
+                
+                if (tile_idx >= total_tiles) break;
+                
+                // Calculate tile coordinates
+                int tile_x = tile_idx % num_tiles_x;
+                int tile_y = tile_idx / num_tiles_x;
+                
+                int tile_start_x = tile_x * tile_size_x;
+                int tile_start_y = tile_y * tile_size_y;
+                int tile_end_x = std::min(tile_start_x + tile_size_x, width);
+                int tile_end_y = std::min(tile_start_y + tile_size_y, height);
+                
+                // Launch kernel for this tile
+                dim3 threadsPerBlock(16, 16);
+                dim3 numBlocks(
+                    (tile_end_x - tile_start_x + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                    (tile_end_y - tile_start_y + threadsPerBlock.y - 1) / threadsPerBlock.y
+                );
+                
+                render_kernel_region<<<numBlocks, threadsPerBlock>>>(
+                    d_pixel_data, width, height,
+                    tile_start_x, tile_start_y, 
+                    tile_end_x, tile_end_y,
+                    d_camera, d_spheres_data, h_num_spheres,
+                    d_cubes_data, h_num_cubes, d_rand_states
+                );
+                
+                // Wait for this tile to complete
+                cudaDeviceSynchronize();
+                
+                // Copy just this tile's results back
+                for (int y = tile_start_y; y < tile_end_y; y++) {
+                    cudaMemcpy(
+                        &h_pixels[y * width + tile_start_x], 
+                        &d_pixel_data[y * width + tile_start_x], 
+                        (tile_end_x - tile_start_x) * sizeof(Vec3), 
+                        cudaMemcpyDeviceToHost
+                    );
                 }
-                pixel_color = vec3_div(pixel_color, (float)SAMPLES_PER_PIXEL);
-                
-                // Gamma correction
-                pixel_color.x = sqrtf(fmaxf(0.0f, pixel_color.x));
-                pixel_color.y = sqrtf(fmaxf(0.0f, pixel_color.y));
-                pixel_color.z = sqrtf(fmaxf(0.0f, pixel_color.z));
-                
-                // Store in host buffer
-                h_pixels[y * width + x] = pixel_color;
             }
         }
-    }
-    
-    cpu_end_time = omp_get_wtime();
-    last_cpu_time = cpu_end_time - cpu_start_time;
-    
-    // Wait for GPU to complete and get results
-    if (gpu_end_row > 0) {
-        cudaDeviceSynchronize();
-        cudaEventRecord(gpu_end_event, 0);
-        cudaEventSynchronize(gpu_end_event);
-        
-        float gpu_time_ms;
-        cudaEventElapsedTime(&gpu_time_ms, gpu_start_event, gpu_end_event);
-        last_gpu_time = gpu_time_ms / 1000.0; // Convert to seconds
-        
-        // Copy GPU results to host buffer (top portion)
-        Vec3* h_gpu_pixels = (Vec3*)malloc(width * gpu_end_row * sizeof(Vec3));
-        gpuErrchk(cudaMemcpy(h_gpu_pixels, d_pixel_data, width * gpu_end_row * sizeof(Vec3), cudaMemcpyDeviceToHost));
-        
-        // Copy GPU results to main buffer
-        for (int y = 0; y < gpu_end_row; y++) {
-            for (int x = 0; x < width; x++) {
-                h_pixels[y * width + x] = h_gpu_pixels[y * width + x];
+
+        // CPU SECTION
+        #pragma omp section
+        {
+            #pragma omp parallel
+            {
+                // Each thread gets its own random seed
+                unsigned int seed = (unsigned int)(time(NULL) + omp_get_thread_num() * 1000);
+                
+                // Process CPU tiles in parallel
+                #pragma omp for schedule(dynamic, 1)
+                for (int i = 0; i < cpu_tiles; i++) {
+                    int tile_idx;
+                    #pragma omp atomic capture
+                    tile_idx = next_tile_atomic++;
+                    
+                    if (tile_idx >= total_tiles) continue;
+                    
+                    // Calculate tile coordinates
+                    int tile_x = tile_idx % num_tiles_x;
+                    int tile_y = tile_idx / num_tiles_x;
+                    
+                    int tile_start_x = tile_x * tile_size_x;
+                    int tile_start_y = tile_y * tile_size_y;
+                    int tile_end_x = std::min(tile_start_x + tile_size_x, width);
+                    int tile_end_y = std::min(tile_start_y + tile_size_y, height);
+                    
+                    // Render this tile
+                    for (int y = tile_start_y; y < tile_end_y; y++) {
+                        for (int x = tile_start_x; x < tile_end_x; x++) {
+                            Vec3 pixel_color = vec3_create(0,0,0);
+                            
+                            for (int s = 0; s < SAMPLES_PER_PIXEL; ++s) {
+                                float u = (float)(x + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (width - 1);
+                                float v_cam = (float)((height - 1 - y) + ((SAMPLES_PER_PIXEL > 1) ? random_float_host(&seed) : 0.5f)) / (height - 1);
+                                
+                                Ray r = camera_get_ray_host(&d_camera, u, v_cam);
+                                pixel_color = vec3_add(pixel_color, ray_color_host(&r, h_spheres_data, h_num_spheres, h_cubes_data, h_num_cubes, MAX_DEPTH, &seed));
+                            }
+                            pixel_color = vec3_div(pixel_color, (float)SAMPLES_PER_PIXEL);
+                            
+                            // Gamma correction
+                            pixel_color.x = sqrtf(fmaxf(0.0f, pixel_color.x));
+                            pixel_color.y = sqrtf(fmaxf(0.0f, pixel_color.y));
+                            pixel_color.z = sqrtf(fmaxf(0.0f, pixel_color.z));
+                            
+                            // Store in host buffer
+                            h_pixels[y * width + x] = pixel_color;
+                        }
+                    }
+                }
             }
+            
+            double cpu_end_time = omp_get_wtime();
+            last_cpu_time = cpu_end_time - cpu_start_time;
         }
-        
-        free(h_gpu_pixels);
     }
     
     // Dynamic load balancing: Adjust split ratio based on performance
     if (last_gpu_time > 0.0 && last_cpu_time > 0.0) {
-        float gpu_pixels_per_sec = (gpu_end_row * width) / last_gpu_time;
-        float cpu_pixels_per_sec = ((height - cpu_start_row) * width) / last_cpu_time;
+        // Calculate pixels processed per second
+        int gpu_pixels = gpu_tiles * tile_size_x * tile_size_y;
+        int cpu_pixels = cpu_tiles * tile_size_x * tile_size_y;
         
-        float total_performance = gpu_pixels_per_sec + cpu_pixels_per_sec;
-        float new_gpu_ratio = gpu_pixels_per_sec / total_performance;
-        
-        // Smooth the adjustment to avoid oscillation
-        gpu_split_ratio = 0.8f * gpu_split_ratio + 0.2f * new_gpu_ratio;
-        
-        // Clamp to reasonable bounds
-        if (gpu_split_ratio < 0.1f) gpu_split_ratio = 0.1f;
-        if (gpu_split_ratio > 0.9f) gpu_split_ratio = 0.9f;
-        
-        printf("Performance: GPU=%.1f Mpix/s, CPU=%.1f Mpix/s, New ratio=%.2f\n", 
-               gpu_pixels_per_sec/1e6, cpu_pixels_per_sec/1e6, gpu_split_ratio);
+        if (gpu_pixels > 0 && cpu_pixels > 0) {
+            float gpu_pixels_per_sec = gpu_pixels / last_gpu_time;
+            float cpu_pixels_per_sec = cpu_pixels / last_cpu_time;
+            
+            float total_performance = gpu_pixels_per_sec + cpu_pixels_per_sec;
+            if (total_performance > 0) {
+                // New split ratio based on relative performance
+                float new_gpu_ratio = gpu_pixels_per_sec / total_performance;
+                
+                // Apply smoothed adjustment
+                gpu_split_ratio = 0.7f * gpu_split_ratio + 0.3f * new_gpu_ratio;
+                
+                // Clamp to reasonable bounds
+                if (gpu_split_ratio < 0.1f) gpu_split_ratio = 0.1f;
+                if (gpu_split_ratio > 0.9f) gpu_split_ratio = 0.9f;
+                
+                printf("Performance: GPU=%.1f Mpix/s (%.1fs), CPU=%.1f Mpix/s (%.1fs), New ratio=%.2f\n", 
+                       gpu_pixels_per_sec/1e6, last_gpu_time, cpu_pixels_per_sec/1e6, last_cpu_time, gpu_split_ratio);
+            }
+        }
     }
     
     // Convert to SDL format
@@ -504,5 +540,4 @@ void render_frame_hybrid(SDL_Renderer *renderer, SDL_Texture *texture, int width
     
     SDL_RenderCopy(renderer, texture, NULL, NULL);
     SDL_RenderPresent(renderer);
-}
 }
